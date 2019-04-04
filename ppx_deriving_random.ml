@@ -64,17 +64,19 @@ let tuple_opt = function
   | args -> Some (Exp.tuple args)
 
 let mapped_expr e =
-  `Ok (Ppx_deriving.mapper.Ast_mapper.expr Ppx_deriving.mapper e)
+  Ok (Ppx_deriving.mapper.Ast_mapper.expr Ppx_deriving.mapper e)
 
 let get_random_fun attrs =
   attrs |> Ppx_deriving.attr ~deriver "random"
         |> Ppx_deriving.Arg.(get_attr ~deriver mapped_expr)
 
+
+
 let get_weight attrs =
   let conv = function
-    | {pexp_desc = Pexp_constant (Const_int n)} -> `Ok (`Int n)
-    | {pexp_desc = Pexp_constant (Const_float x)} -> `Ok (`Float x)
-    | _ -> `Error "@weight must be a constant int or float." in
+    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} -> Ok (`Int (int_of_string n))
+    | {pexp_desc = Pexp_constant (Pconst_float(x,_))} -> Ok (`Float x)
+    | _ -> Error "@weight must be a constant int or float." in
   attrs |> Ppx_deriving.attr ~deriver "weight"
         |> Ppx_deriving.Arg.(get_attr ~deriver conv)
 
@@ -135,9 +137,9 @@ let invalid_case =
 
 let rec expr_of_typ typ =
   let expr_of_rowfield = function
-    | Rtag (label, _, true, []) -> Exp.variant label None
+    | Rtag (label, _, true, []) -> Exp.variant label.Location.txt None
     | Rtag (label, _, false, typs) ->
-      Exp.variant label
+      Exp.variant label.Location.txt
         (tuple_opt (List.map (fun typ -> [%expr [%e expr_of_typ typ]]) typs))
     | Rinherit typ -> expr_of_typ typ
     | _ ->
@@ -160,13 +162,13 @@ let rec expr_of_typ typ =
       let cases =
         fields |> List.mapi @@ fun j field ->
           let result = expr_of_rowfield field in
-          Exp.case (Pat.constant (Const_int j)) result in
+          Exp.case (Pat.constant (Pconst_integer(string_of_int j,None))) result in
       Exp.match_
-        [%expr random_case [%e Exp.constant (Const_int (List.length cases))] rng]
+        [%expr random_case [%e Exp.constant (Pconst_integer(string_of_int(List.length cases),None))] rng]
         (cases @ [invalid_case])
     | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc} ->
       let branch (w, field) cont =
-        [%expr if w > [%e Exp.constant (Const_int w)]
+        [%expr if w > [%e Exp.constant (Pconst_integer(string_of_int w,None))]
                then [%e expr_of_rowfield field]
                else [%e cont] ] in
       begin match cumulative rowfield_attributes fields with
@@ -183,23 +185,27 @@ let rec expr_of_typ typ =
 
 let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
   let expr_of_constr pcd =
-    Exp.construct {txt = Lident pcd.pcd_name.txt; loc = pcd.pcd_name.loc}
-                  (tuple_opt (List.map expr_of_typ pcd.pcd_args)) in
+    match pcd.pcd_args with
+    | Parsetree.Pcstr_tuple l ->
+      Exp.construct {txt = Lident pcd.pcd_name.txt; loc = pcd.pcd_name.loc}
+        (tuple_opt (List.map expr_of_typ l))
+    | Pcstr_record _ -> raise_errorf ~loc "Cannot derive %s for fully abstract type." deriver
+  in
   match type_decl.ptype_kind, type_decl.ptype_manifest with
   | Ptype_abstract, Some manifest ->
     [%expr fun rng -> [%e expr_of_typ manifest]]
   | Ptype_variant constrs, _
         when List.for_all (weight_is_one *< pcd_attributes) constrs ->
     let make_case j pcd =
-      Exp.case (Pat.constant (Const_int j)) (expr_of_constr pcd) in
+      Exp.case (Pat.constant (Pconst_integer(string_of_int j,None))) (expr_of_constr pcd) in
     let cases = List.mapi make_case constrs in
-    let case_count = Exp.constant (Const_int (List.length cases)) in
+    let case_count = Exp.constant (Pconst_integer(string_of_int(List.length cases),None)) in
     [%expr fun rng ->
            [%e Exp.match_ [%expr random_case [%e case_count] rng]
                           (cases @ [invalid_case])] ]
   | Ptype_variant cs, _ ->
     let branch (w, pcd) cont =
-      [%expr if w > [%e Exp.constant (Const_int w)]
+      [%expr if w > [%e Exp.constant (Pconst_integer(string_of_int w,None))]
              then [%e expr_of_constr pcd]
              else [%e cont] ] in
     begin match cumulative pcd_attributes cs with
