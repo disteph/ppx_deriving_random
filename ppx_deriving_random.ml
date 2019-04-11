@@ -73,23 +73,26 @@ let get_random_fun attrs =
 
 
 let get_weight attrs =
-  let conv = function
-    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} -> Ok (`Int (int_of_string n))
-    | {pexp_desc = Pexp_constant (Pconst_float(x,_))} -> Ok (`Float x)
-    | _ -> Error "@weight must be a constant int or float." in
+  let conv x = match x with
+    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} -> Ok (`Int(x,int_of_string n))
+    | {pexp_desc = Pexp_function _ }
+    | {pexp_desc = Pexp_fun _ } -> Ok (`Fun x)
+    | _ -> Ok (`Float x)
+  in
   attrs |> Ppx_deriving.attr ~deriver "weight"
         |> Ppx_deriving.Arg.(get_attr ~deriver conv)
 
-let get_weight_float attrs =
+let get_weight_float attrs rng =
   match get_weight attrs with
-  | None -> 1.0
-  | Some (`Int n) -> float_of_int n
-  | Some (`Float x) -> float_of_string x
+  | None -> [%expr 1.0]
+  | Some (`Int(x,_)) -> [%expr float_of_int([%e x])]
+  | Some (`Fun f)    -> [%expr ([%e f]) ([%e rng])]
+  | Some (`Float x)  -> x
 
 let weight_is_one attrs =
   match get_weight attrs with
   | None -> true
-  | Some (`Int n) when n = 1 -> true
+  | Some (`Int(_,n)) when n = 1 -> true
   | _ -> false
 
 let pcd_attributes pcd = pcd.pcd_attributes
@@ -111,29 +114,37 @@ let random_type_of_decl ~options ~path type_decl =
       {ptyp_desc; ptyp_loc = Location.none; ptyp_attributes = []}
     | _ -> typ in
   Ppx_deriving.poly_arrow_of_type_decl
-    (fun var -> [%type: random_state -> [%t var]])
+    (fun var -> [%type: PPX_Random.state -> [%t var]])
     type_decl
-    [%type: random_state -> [%t typ]]
+    [%type: PPX_Random.state -> [%t typ]]
 
 
 (* Generator Function *)
 
-let cumulative get_attrs cs =
-  let cs = List.map (fun pcd -> get_weight_float (get_attrs pcd), pcd) cs in
-  let c_norm = 1.0 /. List.fold (fun (w, _) -> (+.) w) cs 0.0 in
-  let normalize w =
-    let x = int_of_float (ldexp (w *. c_norm) 30) in
-    (* On 32 bit platforms, 1.0 ± ε will be mapped to min_int. *)
-    if x < 0 then max_int else x in
-  let cs = cs |> List.map (fun (w, pcd) -> (normalize w, pcd))
-              |> List.sort (fun x y -> compare (fst y) (fst x)) in
-  fst @@ List.fold (fun (w, pcd) (acc, rem) -> (rem - w, pcd) :: acc, rem - w)
-                   cs ([], 1 lsl 30)
+let cumulative get_attrs cs rng =
+  let cs = List.map (fun pcd -> get_weight_float (get_attrs pcd) rng, pcd) cs in
+  let total_exp = List.fold (fun (w,_) sofar -> [%expr [%e w] +. [%e sofar]]) cs [%expr 0.0] in
+  let prelude e =
+    [%expr 
+      let c_norm = [%e total_exp] in
+      let normalize w =
+        let x = int_of_float (ldexp (w /. c_norm) 30) in
+        (* On 32 bit platforms, 1.0 ± ε will be mapped to min_int. *)
+        if x < 0 then max_int else x in
+      [%e e]
+    ]
+  in    
+  let cs = cs |> List.map (fun (w,pcd) -> ([%expr normalize([%e w])],pcd)) in
+  let aux (w,pcd) (acc, rem) =
+    let e = [%expr [%e rem] - ([%e w])] in
+    (e,pcd) :: acc, e
+  in
+  prelude, fst @@ List.fold aux cs ([], [%expr 1 lsl 30])
 
 let invalid_case =
   Exp.case [%pat? i]
     [%expr
-      failwith (Printf.sprintf "Value %d from random_case is out of range." i)]
+      failwith (Printf.sprintf "Value %d from PPX_Random.case is out of range." i)]
 
 let rec expr_of_typ typ =
   let expr_of_rowfield = function
@@ -144,7 +155,8 @@ let rec expr_of_typ typ =
     | Rinherit typ -> expr_of_typ typ
     | _ ->
       raise_errorf ~loc:typ.ptyp_loc "Cannot derive %s for %s."
-                   deriver (Ppx_deriving.string_of_core_type typ) in
+        deriver (Ppx_deriving.string_of_core_type typ)
+  in
   match get_random_fun typ.ptyp_attributes with
   | Some f -> app f [[%expr rng]]
   | None ->
@@ -155,7 +167,7 @@ let rec expr_of_typ typ =
         Exp.ident (mknoloc (Ppx_deriving.mangle_lid (`Prefix "random") lid)) in
       let args =
         List.map (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]]) typs in
-      app f (args @ [[%expr rng]])
+      app f (args @ [[%expr (PPX_Random.deepen rng)]])
     | {ptyp_desc = Ptyp_tuple typs} -> Exp.tuple (List.map expr_of_typ typs)
     | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc}
           when List.for_all (weight_is_one *< rowfield_attributes) fields ->
@@ -164,18 +176,21 @@ let rec expr_of_typ typ =
           let result = expr_of_rowfield field in
           Exp.case (Pat.constant (Pconst_integer(string_of_int j,None))) result in
       Exp.match_
-        [%expr random_case [%e Exp.constant (Pconst_integer(string_of_int(List.length cases),None))] rng]
+        [%expr PPX_Random.case [%e Exp.constant (Pconst_integer(string_of_int(List.length cases),None))] rng]
         (cases @ [invalid_case])
     | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc} ->
-      let branch (w, field) cont =
-        [%expr if w > [%e Exp.constant (Pconst_integer(string_of_int w,None))]
+      let branch (iexp, field) cont =
+        [%expr if w > [%e iexp]
                then [%e expr_of_rowfield field]
                else [%e cont] ] in
-      begin match cumulative rowfield_attributes fields with
-      | [] -> assert false
-      | (w, field) :: fields ->
-        [%expr let w = random_case_30b rng in
-               [%e List.fold branch fields (expr_of_rowfield field)]]
+      let prelude,l = cumulative rowfield_attributes fields [%expr rng] in
+      begin
+        match l with
+        | [] -> assert false
+        | (w, field) :: fields ->
+          prelude (
+            [%expr let w = rng |> PPX_Random.case_30b in
+              [%e List.fold branch fields (expr_of_rowfield field)]])
       end
     | {ptyp_desc = Ptyp_var name} -> [%expr [%e evar ("poly_" ^ name)] rng]
     | {ptyp_desc = Ptyp_alias (typ, _)} -> expr_of_typ typ
@@ -201,18 +216,21 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
     let cases = List.mapi make_case constrs in
     let case_count = Exp.constant (Pconst_integer(string_of_int(List.length cases),None)) in
     [%expr fun rng ->
-           [%e Exp.match_ [%expr random_case [%e case_count] rng]
+           [%e Exp.match_ [%expr PPX_Random.case [%e case_count] rng]
                           (cases @ [invalid_case])] ]
   | Ptype_variant cs, _ ->
-    let branch (w, pcd) cont =
-      [%expr if w > [%e Exp.constant (Pconst_integer(string_of_int w,None))]
+    let branch (iexp, pcd) cont =
+      [%expr if w > [%e iexp]
              then [%e expr_of_constr pcd]
              else [%e cont] ] in
-    begin match cumulative pcd_attributes cs with
+    let prelude,l = cumulative pcd_attributes cs [%expr rng] in
+    begin match l with
     | [] -> assert false
     | (w, pcd) :: cs ->
-      [%expr fun rng -> let w = random_case_30b rng in
-                        [%e List.fold branch cs (expr_of_constr pcd)] ]
+      [%expr fun rng ->
+        [%e prelude
+            [%expr let w = rng |> PPX_Random.case_30b in
+              [%e List.fold branch cs (expr_of_constr pcd)] ]]]
     end
   | Ptype_record fields, _ ->
     let fields = fields |> List.map @@ fun pld ->
