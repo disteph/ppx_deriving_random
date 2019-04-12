@@ -70,8 +70,6 @@ let get_random_fun attrs =
   attrs |> Ppx_deriving.attr ~deriver "random"
         |> Ppx_deriving.Arg.(get_attr ~deriver mapped_expr)
 
-
-
 let get_weight attrs =
   let conv x = match x with
     | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} -> Ok (`Int(x,int_of_string n))
@@ -186,8 +184,8 @@ let rec expr_of_typ typ =
       let prelude,l = cumulative rowfield_attributes fields [%expr rng] in
       begin
         match l with
-        | [] -> assert false
-        | (w, field) :: fields ->
+        | [] -> assert false (* There's at least one constructor *)
+        | (_, field) :: fields ->
           prelude (
             [%expr let w = rng |> PPX_Random.case_30b in
               [%e List.fold branch fields (expr_of_rowfield field)]])
@@ -225,8 +223,8 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
              else [%e cont] ] in
     let prelude,l = cumulative pcd_attributes cs [%expr rng] in
     begin match l with
-    | [] -> assert false
-    | (w, pcd) :: cs ->
+    | [] -> assert false (* There's at least one constructor *)
+    | (_, pcd) :: cs ->
       [%expr fun rng ->
         [%e prelude
             [%expr let w = rng |> PPX_Random.case_30b in
