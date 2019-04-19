@@ -1,5 +1,7 @@
 (* Copyright (C) 2015--2016  Petter A. Urkedal <paurkedal@gmail.com>
  *
+ * Edited by Stephane.Graham-Lengrand <disteph@gmail.com> (2019)
+ *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or (at your
@@ -70,28 +72,57 @@ let get_random_fun attrs =
   attrs |> Ppx_deriving.attr ~deriver "random"
         |> Ppx_deriving.Arg.(get_attr ~deriver mapped_expr)
 
+(* Get weights from attributes *)
 let get_weight attrs =
   let conv x = match x with
-    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} -> Ok (`Int(x,int_of_string n))
-    | {pexp_desc = Pexp_function _ }
-    | {pexp_desc = Pexp_fun _ } -> Ok (`Fun x)
-    | _ -> Ok (`Float x)
+    | {pexp_desc = Pexp_constant (Pconst_float(n,_))} -> Ok (`Float(x,float_of_string n))
+    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} ->
+      let f = float_of_int(int_of_string n) in
+      let x_float = n |> Const.float |> Exp.constant in
+      Ok (`Float(x_float,f))
+    | _ -> Ok (`Fun x)
   in
   attrs |> Ppx_deriving.attr ~deriver "weight"
         |> Ppx_deriving.Arg.(get_attr ~deriver conv)
 
+(* Check whether the weight is static (fixed int or float, not a function) *)
+
+let weight_is_static attrs =
+  match get_weight attrs with
+  | None
+  | Some (`Float _) -> true
+  | _ -> false
+
+(* Checks whether weights are static and uniform *)
+    
+let weights_are_uniform attrs =
+  let rec aux ?weight = function
+    | [] -> true
+    | head::tail -> 
+      match get_weight head, weight with
+      | None, None               -> aux ~weight:1. tail
+      | Some (`Float(_,n)), None -> aux ~weight:n tail
+      | None, Some w when w = 1. -> aux ?weight tail
+      | Some (`Float(_,n)), Some w when n = w -> aux ?weight tail
+      | _ -> false
+  in
+  aux attrs
+
+(* Assumes the weight is static; gets it as a float. *)
+
+let get_weight_float_static attrs =
+  match get_weight attrs with
+  | None -> 1.
+  | Some (`Float(_,n)) -> n
+  | Some (`Fun _)      -> assert false
+
+(* General case where the weight is dynamic, i.e. depends on local state; gets the weight as a float when given the state. *)
+
 let get_weight_float attrs rng =
   match get_weight attrs with
-  | None -> [%expr 1.0]
-  | Some (`Int(x,_)) -> [%expr float_of_int([%e x])]
-  | Some (`Fun f)    -> [%expr ([%e f]) ([%e rng])]
-  | Some (`Float x)  -> x
-
-let weight_is_one attrs =
-  match get_weight attrs with
-  | None -> true
-  | Some (`Int(_,n)) when n = 1 -> true
-  | _ -> false
+  | None               -> [%expr 1.0]
+  | Some (`Float(x,_)) -> x
+  | Some (`Fun f)      -> [%expr ([%e f]) ([%e rng])]
 
 let pcd_attributes pcd = pcd.pcd_attributes
 
@@ -118,6 +149,22 @@ let random_type_of_decl ~options ~path type_decl =
 
 
 (* Generator Function *)
+
+(* Generates the list of cases when the weights are static *)
+
+let cumulative_static get_attrs cs =
+  let cs = List.map (fun pcd -> get_weight_float_static (get_attrs pcd), pcd) cs in
+  let c_norm = 1.0 /. List.fold (fun (w, _) -> (+.) w) cs 0.0 in
+  let normalize w =
+    let x = int_of_float (ldexp (w *. c_norm) 30) in
+    (* On 32 bit platforms, 1.0 ± ε will be mapped to min_int. *)
+    if x < 0 then max_int else x in
+  let cs = cs |> List.map (fun (w, pcd) -> (normalize w, pcd))
+              |> List.sort (fun x y -> compare (fst y) (fst x)) in
+  fst @@ List.fold (fun (w, pcd) (acc, rem) -> (rem - w, pcd) :: acc, rem - w)
+                   cs ([], 1 lsl 30)
+
+(* Generates the list of cases when the weights are dynamic *)
 
 let cumulative get_attrs cs rng =
   let cs = List.map (fun pcd -> get_weight_float (get_attrs pcd) rng, pcd) cs in
@@ -148,8 +195,7 @@ let rec expr_of_typ typ =
   let expr_of_rowfield = function
     | Rtag (label, _, true, []) -> Exp.variant label.Location.txt None
     | Rtag (label, _, false, typs) ->
-      Exp.variant label.Location.txt
-        (tuple_opt (List.map (fun typ -> [%expr [%e expr_of_typ typ]]) typs))
+      Exp.variant label.Location.txt (tuple_opt (List.map expr_of_typ typs))
     | Rinherit typ -> expr_of_typ typ
     | _ ->
       raise_errorf ~loc:typ.ptyp_loc "Cannot derive %s for %s."
@@ -165,17 +211,32 @@ let rec expr_of_typ typ =
         Exp.ident (mknoloc (Ppx_deriving.mangle_lid (`Prefix "random") lid)) in
       let args =
         List.map (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]]) typs in
-      app f (args @ [[%expr (PPX_Random.deepen rng)]])
+       app f (args @ [[%expr PPX_Random.deepen rng]])
     | {ptyp_desc = Ptyp_tuple typs} -> Exp.tuple (List.map expr_of_typ typs)
+
+    (* The following case is an optimisation of the case below: if all weights are static and equal to 1., no need to run fancy code *)
     | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc}
-          when List.for_all (weight_is_one *< rowfield_attributes) fields ->
-      let cases =
-        fields |> List.mapi @@ fun j field ->
-          let result = expr_of_rowfield field in
-          Exp.case (Pat.constant (Pconst_integer(string_of_int j,None))) result in
-      Exp.match_
-        [%expr PPX_Random.case [%e Exp.constant (Pconst_integer(string_of_int(List.length cases),None))] rng]
-        (cases @ [invalid_case])
+      when fields |> List.map rowfield_attributes |> weights_are_uniform  ->
+      let make_case j field = Exp.case (j |> Const.int |> Pat.constant) (expr_of_rowfield field) in
+      let cases = List.mapi make_case fields in
+      let case_count = cases |> List.length |> Const.int |> Exp.constant in
+      Exp.match_ [%expr PPX_Random.case [%e case_count ] rng] (cases @ [invalid_case])
+
+    (* In the following case, weights are not all equal to 1. but are static, so we can compute probabilities statically *)
+    | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc}
+      when List.for_all (weight_is_static *< rowfield_attributes) fields ->
+      let branch (i, field) cont =
+        [%expr if w > [%e Exp.constant (Const.int i)]
+          then [%e expr_of_rowfield field]
+          else [%e cont] ] in
+      begin match cumulative_static rowfield_attributes fields with
+        | [] -> assert false
+        | (_, field) :: fields ->
+          [%expr let w = PPX_Random.case_30b rng in
+            [%e List.fold branch fields (expr_of_rowfield field)]]
+      end
+
+    (* In the general case, weights are dynamic so we compute probabilities at every call *)
     | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc} ->
       let branch (iexp, field) cont =
         [%expr if w > [%e iexp]
@@ -187,7 +248,7 @@ let rec expr_of_typ typ =
         | [] -> assert false (* There's at least one constructor *)
         | (_, field) :: fields ->
           prelude (
-            [%expr let w = rng |> PPX_Random.case_30b in
+            [%expr let w = PPX_Random.case_30b rng in
               [%e List.fold branch fields (expr_of_rowfield field)]])
       end
     | {ptyp_desc = Ptyp_var name} -> [%expr [%e evar ("poly_" ^ name)] rng]
@@ -208,14 +269,26 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
   | Ptype_abstract, Some manifest ->
     [%expr fun rng -> [%e expr_of_typ manifest]]
   | Ptype_variant constrs, _
-        when List.for_all (weight_is_one *< pcd_attributes) constrs ->
-    let make_case j pcd =
-      Exp.case (Pat.constant (Pconst_integer(string_of_int j,None))) (expr_of_constr pcd) in
+    when constrs |> List.map pcd_attributes |> weights_are_uniform  ->
+    let make_case j pcd = Exp.case (j |> Const.int |> Pat.constant) (expr_of_constr pcd) in
     let cases = List.mapi make_case constrs in
-    let case_count = Exp.constant (Pconst_integer(string_of_int(List.length cases),None)) in
+    let case_count = cases |> List.length |> Const.int |> Exp.constant in
     [%expr fun rng ->
-           [%e Exp.match_ [%expr PPX_Random.case [%e case_count] rng]
-                          (cases @ [invalid_case])] ]
+      [%e Exp.match_ [%expr PPX_Random.case [%e case_count] rng] (cases @ [invalid_case])] ]
+
+  | Ptype_variant cs, _
+    when List.for_all (weight_is_static *< pcd_attributes) cs ->
+    let branch (w, pcd) cont =
+      [%expr if w > [%e Exp.constant (Const.int w)]
+        then [%e expr_of_constr pcd]
+        else [%e cont] ] in
+    begin match cumulative_static pcd_attributes cs with
+      | [] -> assert false
+      | (_, pcd) :: cs ->
+        [%expr fun rng -> let w = PPX_Random.case_30b rng in
+          [%e List.fold branch cs (expr_of_constr pcd)] ]
+    end
+
   | Ptype_variant cs, _ ->
     let branch (iexp, pcd) cont =
       [%expr if w > [%e iexp]
@@ -227,7 +300,7 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
     | (_, pcd) :: cs ->
       [%expr fun rng ->
         [%e prelude
-            [%expr let w = rng |> PPX_Random.case_30b in
+            [%expr let w = PPX_Random.case_30b rng in
               [%e List.fold branch cs (expr_of_constr pcd)] ]]]
     end
   | Ptype_record fields, _ ->
