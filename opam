@@ -1,5 +1,6 @@
 opam-version: "1.2"
 name: "ppx_deriving_random"
+version: "1.0"
 maintainer: "Stephane Graham-Lengrand <stephane.graham-lengrand@csl.sri.com>"
 authors: "Petter A. Urkedal <paurkedal@gmail.com> and Stephane Graham-Lengrand <stephane.graham-lengrand@csl.sri.com>"
 homepage: "https://github.com/disteph/ppx_deriving_random"
@@ -23,5 +24,3 @@ depends: [
   "ppx_deriving"
   "ppx_tools"
 ]
-synopsis: "Syntax extension to generate random instances of types"
-flags: light-uninstall
