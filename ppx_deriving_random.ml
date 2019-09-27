@@ -201,6 +201,7 @@ let rec expr_of_typ typ =
       raise_errorf ~loc:typ.ptyp_loc "Cannot derive %s for %s."
         deriver (Ppx_deriving.string_of_core_type typ)
   in
+  let expr_of_rowfield field = [%expr (fun rng -> [%e expr_of_rowfield field]) (PPX_Random.deepen rng)] in
   match get_random_fun typ.ptyp_attributes with
   | Some f -> app f [[%expr rng]]
   | None ->
@@ -211,7 +212,7 @@ let rec expr_of_typ typ =
         Exp.ident (mknoloc (Ppx_deriving.mangle_lid (`Prefix "random") lid)) in
       let args =
         List.map (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]]) typs in
-       app f (args @ [[%expr PPX_Random.deepen rng]])
+      app f (args @ [[%expr rng]])
     | {ptyp_desc = Ptyp_tuple typs} -> Exp.tuple (List.map expr_of_typ typs)
 
     (* The following case is an optimisation of the case below: if all weights are static and equal to 1., no need to run fancy code *)
@@ -263,8 +264,9 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
     | Parsetree.Pcstr_tuple l ->
       Exp.construct {txt = Lident pcd.pcd_name.txt; loc = pcd.pcd_name.loc}
         (tuple_opt (List.map expr_of_typ l))
-    | Pcstr_record _ -> raise_errorf ~loc "Cannot derive %s for fully abstract type." deriver
+    | Parsetree.Pcstr_record _ -> raise_errorf ~loc "Cannot derive %s for constructor with record argument." deriver
   in
+  let expr_of_constr field = [%expr (fun rng -> [%e expr_of_constr field]) (PPX_Random.deepen rng)] in
   match type_decl.ptype_kind, type_decl.ptype_manifest with
   | Ptype_abstract, Some manifest ->
     [%expr fun rng -> [%e expr_of_typ manifest]]
