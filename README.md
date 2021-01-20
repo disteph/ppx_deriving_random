@@ -106,7 +106,7 @@ computation.  This can be fixed by weighing the constructors:
 ```ocaml
 type 'a free_magma =
   | Fm_gen of 'a [@weight 3]
-  | Fm_mul of 'a free_magma * 'a free_magma [@weight 1.5]
+  | Fm_mul of 'a free_magma * 'a free_magma [@weight 2.5]
   [@@deriving random]
 ```
 

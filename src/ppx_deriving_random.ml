@@ -272,11 +272,17 @@ let rec expr_of_typ typ =
 
 let expr_of_type_decl ({ptype_loc = loc; _ } as type_decl) =
   let expr_of_constr pcd =
+    let lid = {txt = Lident pcd.pcd_name.txt; loc = pcd.pcd_name.loc} in
     match pcd.pcd_args with
     | Parsetree.Pcstr_tuple l ->
-      Exp.construct {txt = Lident pcd.pcd_name.txt; loc = pcd.pcd_name.loc}
-        (tuple_opt (List.map expr_of_typ l))
-    | Parsetree.Pcstr_record _ -> raise_errorf ~loc "Cannot derive %s for constructor with record argument." deriver
+      Exp.construct lid (tuple_opt (List.map expr_of_typ l))
+    | Parsetree.Pcstr_record l ->
+       let aux (label_dec : label_declaration) =
+         let lid = {txt = Lident label_dec.pld_name.txt; loc = label_dec.pld_name.loc} in
+         (lid, expr_of_typ label_dec.pld_type)
+       in
+       let args = List.map aux l in
+       Exp.construct lid (Some(Exp.record args None))
   in
   let expr_of_constr field = [%expr (fun rng -> [%e expr_of_constr field]) (PPX_Random.deepen rng)] in
   match type_decl.ptype_kind, type_decl.ptype_manifest with
