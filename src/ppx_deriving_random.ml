@@ -16,12 +16,13 @@
  * along with this library.  If not, see <http://www.gnu.org/licenses/>.
  *)
 
+open Ppxlib
+
 open Longident
-open Location
 open Asttypes
 open Parsetree
 open Ast_helper
-open Ast_convenience
+open Ppx_deriving.Ast_convenience
 
 let deriver = "random"
 
@@ -65,8 +66,10 @@ let tuple_opt = function
   | [arg] -> Some arg
   | args -> Some (Exp.tuple args)
 
+let mapper = new Ppx_deriving.mapper
+
 let mapped_expr e =
-  Ok (Ppx_deriving.mapper.Ast_mapper.expr Ppx_deriving.mapper e)
+  Ok (mapper#expression e)
 
 let get_random_fun attrs =
   attrs |> Ppx_deriving.attr ~deriver "random"
@@ -75,8 +78,8 @@ let get_random_fun attrs =
 (* Get weights from attributes *)
 let get_weight attrs =
   let conv x = match x with
-    | {pexp_desc = Pexp_constant (Pconst_float(n,_))} -> Ok (`Float(x,float_of_string n))
-    | {pexp_desc = Pexp_constant (Pconst_integer(n,_))} ->
+    | {pexp_desc = Pexp_constant (Pconst_float(n,_)) ; _ } -> Ok (`Float(x,float_of_string n))
+    | {pexp_desc = Pexp_constant (Pconst_integer(n,_)) ; _ } ->
       let f = float_of_int(int_of_string n) in
       let x_float = n |> Const.float |> Exp.constant in
       Ok (`Float(x_float,f))
@@ -118,29 +121,33 @@ let get_weight_float_static attrs =
 
 (* General case where the weight is dynamic, i.e. depends on local state; gets the weight as a float when given the state. *)
 
-let get_weight_float attrs rng =
+let get_weight_float loc attrs rng =
   match get_weight attrs with
   | None               -> [%expr 1.0]
   | Some (`Float(x,_)) -> x
   | Some (`Fun f)      -> [%expr ([%e f]) ([%e rng])]
 
 let pcd_attributes pcd = pcd.pcd_attributes
+                       
+let rowfield_attributes { prf_attributes ; _ } = prf_attributes
 
-let rowfield_attributes = function
-  | Rtag (_, a, _, _)
-  | Rinherit {ptyp_attributes = a} -> a
-
-
+            
 (* Generator Type *)
 
-let random_type_of_decl ~options ~path type_decl =
+let random_type_of_decl ~options ~path:_path type_decl =
+  let loc = type_decl.ptype_loc in
   parse_options options;
   let typ = Ppx_deriving.core_type_of_type_decl type_decl in
   let typ =
     match type_decl.ptype_manifest with
-    | Some {ptyp_desc = Ptyp_variant (_, Closed, _)} ->
-      let ptyp_desc = Ptyp_variant ([Rinherit typ], Open, None) in
-      {ptyp_desc; ptyp_loc = Location.none; ptyp_attributes = []}
+    | Some {ptyp_desc = Ptyp_variant (_, Closed, _) ; _ } ->
+       let row_field = {
+           prf_desc = Rinherit typ;
+           prf_loc  = typ.Parsetree.ptyp_loc ;
+           prf_attributes = [];
+         } in
+       let ptyp_desc = Ptyp_variant ([row_field], Open, None) in
+       {ptyp_desc; ptyp_loc = Location.none; ptyp_attributes = []; ptyp_loc_stack = []}
     | _ -> typ in
   Ppx_deriving.poly_arrow_of_type_decl
     (fun var -> [%type: PPX_Random.state -> [%t var]])
@@ -160,14 +167,14 @@ let cumulative_static get_attrs cs =
     (* On 32 bit platforms, 1.0 ± ε will be mapped to min_int. *)
     if x < 0 then max_int else x in
   let cs = cs |> List.map (fun (w, pcd) -> (normalize w, pcd))
-              |> List.sort (fun x y -> compare (fst y) (fst x)) in
+              |> List.sort (fun x y -> Int.compare (fst y) (fst x)) in
   fst @@ List.fold (fun (w, pcd) (acc, rem) -> (rem - w, pcd) :: acc, rem - w)
                    cs ([], 1 lsl 30)
 
 (* Generates the list of cases when the weights are dynamic *)
 
-let cumulative get_attrs cs rng =
-  let cs = List.map (fun pcd -> get_weight_float (get_attrs pcd) rng, pcd) cs in
+let cumulative loc get_attrs cs rng =
+  let cs = List.map (fun pcd -> get_weight_float loc (get_attrs pcd) rng, pcd) cs in
   let total_exp = List.fold (fun (w,_) sofar -> [%expr [%e w] +. [%e sofar]]) cs [%expr 0.0] in
   let prelude e =
     [%expr 
@@ -186,45 +193,50 @@ let cumulative get_attrs cs rng =
   in
   prelude, fst @@ List.fold aux cs ([], [%expr 1 lsl 30])
 
-let invalid_case =
+let invalid_case loc =
   Exp.case [%pat? i]
     [%expr
       failwith (Printf.sprintf "Value %d from PPX_Random.case is out of range." i)]
 
 let rec expr_of_typ typ =
   let expr_of_rowfield = function
-    | Rtag (label, _, true, []) -> Exp.variant label.Location.txt None
-    | Rtag (label, _, false, typs) ->
+    | Rtag (label, true, []) -> Exp.variant label.Location.txt None
+    | Rtag (label, false, typs) ->
       Exp.variant label.Location.txt (tuple_opt (List.map expr_of_typ typs))
     | Rinherit typ -> expr_of_typ typ
     | _ ->
       raise_errorf ~loc:typ.ptyp_loc "Cannot derive %s for %s."
         deriver (Ppx_deriving.string_of_core_type typ)
   in
-  let expr_of_rowfield field = [%expr (fun rng -> [%e expr_of_rowfield field]) (PPX_Random.deepen rng)] in
+  let expr_of_rowfield field =
+    let loc = field.prf_loc in
+    [%expr (fun rng -> [%e expr_of_rowfield field.prf_desc]) (PPX_Random.deepen rng)]
+  in
   match get_random_fun typ.ptyp_attributes with
-  | Some f -> app f [[%expr rng]]
+  | Some f ->
+     let loc = f.pexp_loc in
+     app f [[%expr rng]]
   | None ->
-    match typ with
-    | [%type: unit] -> [%expr ()]
-    | {ptyp_desc = Ptyp_constr ({txt = lid}, typs)} ->
-      let f =
-        Exp.ident (mknoloc (Ppx_deriving.mangle_lid (`Prefix "random") lid)) in
-      let args =
-        List.map (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]]) typs in
-      app f (args @ [[%expr rng]])
-    | {ptyp_desc = Ptyp_tuple typs} -> Exp.tuple (List.map expr_of_typ typs)
+     let loc = typ.ptyp_loc in 
+     match typ with
+     | [%type: unit] -> [%expr ()]
+     | {ptyp_desc = Ptyp_constr ({txt = lid ; _ }, typs); _} ->
+        let f    = Exp.ident (mknoloc (Ppx_deriving.mangle_lid (`Prefix "random") lid)) in
+        let args = List.map (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]]) typs in
+        app f (args @ [[%expr rng]])
+     | {ptyp_desc = Ptyp_tuple typs ; _ } -> Exp.tuple (List.map expr_of_typ typs)
 
     (* The following case is an optimisation of the case below: if all weights are static and equal to 1., no need to run fancy code *)
-    | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc}
-      when fields |> List.map rowfield_attributes |> weights_are_uniform  ->
-      let make_case j field = Exp.case (j |> Const.int |> Pat.constant) (expr_of_rowfield field) in
-      let cases = List.mapi make_case fields in
-      let case_count = cases |> List.length |> Const.int |> Exp.constant in
-      Exp.match_ [%expr PPX_Random.case [%e case_count ] rng] (cases @ [invalid_case])
+     | {ptyp_desc = Ptyp_variant (fields, _, _); _ }
+          when fields |> List.map rowfield_attributes |> weights_are_uniform  ->
+        let make_case j field =
+          Exp.case (j |> Const.int |> Pat.constant) (expr_of_rowfield field) in
+        let cases = List.mapi make_case fields in
+        let case_count = cases |> List.length |> Const.int |> Exp.constant in
+        Exp.match_ [%expr PPX_Random.case [%e case_count ] rng] (cases @ [invalid_case loc])
 
     (* In the following case, weights are not all equal to 1. but are static, so we can compute probabilities statically *)
-    | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc}
+    | {ptyp_desc = Ptyp_variant (fields, _, _) ; _ }
       when List.for_all (weight_is_static *< rowfield_attributes) fields ->
       let branch (i, field) cont =
         [%expr if w > [%e Exp.constant (Const.int i)]
@@ -238,12 +250,12 @@ let rec expr_of_typ typ =
       end
 
     (* In the general case, weights are dynamic so we compute probabilities at every call *)
-    | {ptyp_desc = Ptyp_variant (fields, _, _); ptyp_loc} ->
+    | {ptyp_desc = Ptyp_variant (fields, _, _); _ } ->
       let branch (iexp, field) cont =
         [%expr if w > [%e iexp]
                then [%e expr_of_rowfield field]
                else [%e cont] ] in
-      let prelude,l = cumulative rowfield_attributes fields [%expr rng] in
+      let prelude,l = cumulative loc rowfield_attributes fields [%expr rng] in
       begin
         match l with
         | [] -> assert false (* There's at least one constructor *)
@@ -252,13 +264,13 @@ let rec expr_of_typ typ =
             [%expr let w = PPX_Random.case_30b rng in
               [%e List.fold branch fields (expr_of_rowfield field)]])
       end
-    | {ptyp_desc = Ptyp_var name} -> [%expr [%e evar ("poly_" ^ name)] rng]
-    | {ptyp_desc = Ptyp_alias (typ, _)} -> expr_of_typ typ
-    | {ptyp_loc} ->
+    | {ptyp_desc = Ptyp_var name ; _ } -> [%expr [%e evar ("poly_" ^ name)] rng]
+    | {ptyp_desc = Ptyp_alias (typ, _) ; _ } -> expr_of_typ typ
+    | {ptyp_loc ; _ } ->
       raise_errorf ~loc:ptyp_loc "Cannot derive %s for %s."
                    deriver (Ppx_deriving.string_of_core_type typ)
 
-let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
+let expr_of_type_decl ({ptype_loc = loc; _ } as type_decl) =
   let expr_of_constr pcd =
     match pcd.pcd_args with
     | Parsetree.Pcstr_tuple l ->
@@ -276,7 +288,7 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
     let cases = List.mapi make_case constrs in
     let case_count = cases |> List.length |> Const.int |> Exp.constant in
     [%expr fun rng ->
-      [%e Exp.match_ [%expr PPX_Random.case [%e case_count] rng] (cases @ [invalid_case])] ]
+      [%e Exp.match_ [%expr PPX_Random.case [%e case_count] rng] (cases @ [invalid_case loc])] ]
 
   | Ptype_variant cs, _
     when List.for_all (weight_is_static *< pcd_attributes) cs ->
@@ -296,7 +308,7 @@ let expr_of_type_decl ({ptype_loc = loc} as type_decl) =
       [%expr if w > [%e iexp]
              then [%e expr_of_constr pcd]
              else [%e cont] ] in
-    let prelude,l = cumulative pcd_attributes cs [%expr rng] in
+    let prelude,l = cumulative loc pcd_attributes cs [%expr rng] in
     begin match l with
     | [] -> assert false (* There's at least one constructor *)
     | (_, pcd) :: cs ->
@@ -338,7 +350,7 @@ let str_of_type ~options ~path type_decl =
 let () =
   Ppx_deriving.register @@
   Ppx_deriving.create deriver
-    ~core_type: (fun typ -> [%expr fun rng -> [%e expr_of_typ typ]])
+    ~core_type: (fun typ -> let loc = typ.ptyp_loc in [%expr fun rng -> [%e expr_of_typ typ]])
     ~type_decl_str: (fun ~options ~path type_decls ->
       [Str.value Recursive
         (List.concat (List.map (str_of_type ~options ~path) type_decls))])
