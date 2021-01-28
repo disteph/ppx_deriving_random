@@ -16,7 +16,7 @@ remove: [
 ]
 depends: [
   "ocaml" {>= "4.11.0"}
-  "dune" {build, >= "2.8.2"}
+  "dune" {>= "2.8.2"}
   "ocamlfind" {build}
   "ppx_deriving"
   "ppx_tools"
